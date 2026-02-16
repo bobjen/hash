@@ -6,6 +6,12 @@
 
 int main(int argc, const char** argv)
 {
+    printf("timing test started\n");
+    g_crc->TimingTest();
+    printf("timing test ended\n\n");
+
+    printf("running correctness test (about 11 seconds):\n");
     printf("crctest: %s\n", g_crc->SelfTest() ? "passed" : "failed");
+    
     return 0;
 }

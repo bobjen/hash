@@ -4,16 +4,16 @@
 #include <stddef.h>
 
 #ifdef _MSC_VER
-  typedef  unsigned __int64 u8;
-  typedef  unsigned __int32 u4;
-  typedef  unsigned __int16 u2;
-  typedef  unsigned __int8  u1;
+  typedef  unsigned __int64 u64;
+  typedef  unsigned __int32 u32;
+  typedef  unsigned __int16 u16;
+  typedef  unsigned __int8  u8;
 #else
 # include <stdint.h>
-  typedef  uint64_t  u8;
-  typedef  uint32_t  u4;
-  typedef  uint16_t  u2;
-  typedef  uint8_t   u1;
+  typedef  uint64_t  u64;
+  typedef  uint32_t  u32;
+  typedef  uint16_t  u16;
+  typedef  uint8_t   u8;
 #endif
 
 class CrcInternal;
@@ -32,20 +32,20 @@ public:
     ~Crc();
 
     // compute the CRC of an array src of length len with initial crc crc
-    u8 Compute(
+    u64 Compute(
         const void* src,
-        u8 len,
-        u8 crc) const;
+        u64 len,
+        u64 crc) const;
 
     // Given the CRC and size of A and B, compute the CRC of (A concat B).
-    u8 Concat(
-        u8 initCrcAB,
-        u8 initCrcA,
-        u8 finalCrcA,
-        u8 sizeA,
-        u8 initCrcB,
-        u8 finalCrcB,
-        u8 sizeB) const;
+    u64 Concat(
+        u64 initCrcAB,
+        u64 initCrcA,
+        u64 finalCrcA,
+        u64 sizeA,
+        u64 initCrcB,
+        u64 finalCrcB,
+        u64 sizeB) const;
 
     // Corrupt CRCs may be due to corrupt internal tables.
     // Check internal tables are not corrupt (using CRC and known values).
@@ -53,6 +53,7 @@ public:
     const char* MemoryCheck() const;
 
     bool SelfTest() const;
+    void TimingTest() const;
 };
 
 extern Crc* g_crc;

@@ -1,6 +1,11 @@
 #include "crc.h"
-#include <x86intrin.h>
 #include <stdio.h>
+#include <chrono>
+#include <cstring>
+#if defined(__SSE__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1) || defined(_M_X64)
+#  include <x86intrin.h>
+// #  define HAS_INTRINSICS
+#endif
 
 #ifndef nullptr
 # define nullptr NULL
@@ -8,76 +13,79 @@
 
 Crc* g_crc = new Crc();
 
-static const u2 c_nByteValues = 256;
-static const u2 c_nSliceBits = 8;
-static const u2 c_nSliceValues = 1 << c_nSliceBits;
+static const u16 c_nByteValues = 256;
+static const u16 c_nSliceBits = 8;
+static const u16 c_nSliceValues = 1 << c_nSliceBits;
 
-#if !defined(_M_AMD64) && !defined(_M_IX86)
-#  define USE_KARATSUBA
-#endif
 
 // This produces the same bits as crc64nvme.
 // I made an effort for Compute() of small values and Concat() to be fast.
 // This polynomial shifts right every bit, not left, so the polynomial gets XORed if (val & 0x1).
 // Multiplication is mostly symmetric, but you do carries of low 8 bytes to top, not high 8 bytes to bottom.
-// CRC also XORs ~((u8)0) before and after every Compute(), but for Concat(), those all cancel out.
+// CRC also XORs ~((u64)0) before and after every Compute(), but for Concat(), those all cancel out.
 // Define CrcInternal here so the .h file does not need to include the intrinsic .h files.
 class CrcInternal
 {
 public:
-    static const u8 c_complement = ~u8(0);
-    static const u8 c_poly = 0x9a6c9329ac4bc9b5UL;  // primitive polynomial, other than the 1
-    static const int c_nCarries = sizeof(u8);
-    static const int c_nBits = 8*sizeof(u8);
+    static const u64 c_complement = ~u64(0);
+    static const u64 c_poly = 0x9a6c9329ac4bc9b5UL;  // primitive polynomial, other than the 1
+    static const int c_nCarries = sizeof(u64);
+    static const int c_nBits = 8*sizeof(u64);
     static const int c_folds = 32;
     static const int c_nSlices = 1 + ((c_nBits-1)/c_nSliceBits);
-    static const u8 c_msb = (((u8)1) << (c_nBits - 1));  // most significant bit
+    static const u64 c_msb = (((u64)1) << (c_nBits - 1));  // most significant bit
+    u64 *m_carry[c_nCarries];  // 64-bit multiplication yields a 128 bit result: carries for low 8 bytes
+    u64 *m_slice[c_nSlices];  // premultiply m_pow[] values for 16-bit slices of "size"
+    u16 *m_mult[c_nByteValues];  // m_mult[i][j] is carryless i*j, with i and j both 8-bit values
+
+#ifdef HAS_INTRINSICS
     __m128i m_tab[1 << 4]; // ((4-bit-value *)&m_tab[i])[j] is carryless i*j, with i and j both 4-bit values
-    u2 *m_mult[c_nByteValues];  // m_mult[i][j] is carryless i*j, with i and j both 8-bit values
-    u8 *m_carry[c_nCarries];  // 64-bit multiplication yields a 128 bit result: carries for low 8 bytes
-    u8 *m_slice[c_nSlices];  // premultiply m_pow[] values for 16-bit slices of "size"
     __m128i m_fold[c_folds];  // coefficients for the bulk of the data for compute
     __m128i m_tail;  // coefficients for the last few bytes for compute
     __m128i m_barrett;  // coefficients for Barrett reduction
+#endif // HAS_INTRINSICS
 
-    __m128i Set128(u8 high, u8 low) const
+
+#ifdef HAS_INTRINSICS
+    __m128i Set128(u64 high, u64 low) const
     {
         __m128i z;
-        ((u8 *)&z)[1] = high;
-        ((u8 *)&z)[0] = low;
+        ((u64 *)&z)[1] = high;
+        ((u64 *)&z)[0] = low;
         return z;
     }
-
+#endif // HAS_INTRINSICS
+    
     CrcInternal()
     {
-        // ((u1 *)&m_tab[iFrag])[iValue] is carryless iFrag * iValue
+#ifdef HAS_INTRINSICS
+        // ((u8 *)&m_tab[iFrag])[iValue] is carryless iFrag * iValue
         // _mm_shuffle_epi8 can use this to accomplish 16 4x4-bit multiplications at once
-        for (u1 iFrag = 0; iFrag < 16; iFrag++)
+        for (u8 iFrag = 0; iFrag < 16; iFrag++)
         {
             m_tab[iFrag] = _mm_set_epi32(0,0,0,0);
-            for (u1 iBit = 0;  iBit < 4;  iBit++)
+            for (u8 iBit = 0;  iBit < 4;  iBit++)
             {
                 if (iFrag & (1 << iBit))
                 {
-                    for (u1 iValue = 0;  iValue < 16;  iValue++)
+                    for (u8 iValue = 0;  iValue < 16;  iValue++)
                     {
-                        ((u1 *)&m_tab[iFrag])[iValue] ^= (iValue << iBit);
+                        ((u8 *)&m_tab[iFrag])[iValue] ^= (iValue << iBit);
                     }
                 }
             }
         }
 
-#ifdef USE_KARATSUBA
-        InitMult();
+        // initializing multiplication tables is 0.01 seconds, don't delay process start if you do not have to        
+        memset(m_mult, 0, sizeof(m_mult));        
 #else
-        // initializing multiplication tables is 0.01 seconds, don't delay process start if you do not have to
-        memset(m_mult, 0, sizeof(m_mult));
-#endif // USE_KARATSUBA
+        InitMult();
+#endif // HAS_INTRINSICS
 
         // These other tables are always required, and faster to derive on the fly than read off disk
         for (int iCarry = c_nCarries;  iCarry--;)
         {
-            u8* table = new u8[c_nByteValues];  // one for each byte value
+            u64* table = new u64[c_nByteValues];  // one for each byte value
             if (table == nullptr)
             {
                 fprintf(stderr, "error: crc could not allocate m_carry[%d]\n", iCarry);
@@ -91,10 +99,10 @@ public:
         }
 
         // carries for multiplying an 8-byte value by c_poly
-        u8 pow = c_poly;  // pow is 2^(c_nBits+iBit+8*iCarry) mod c_poly
+        u64 pow = c_poly;  // pow is 2^(c_nBits+iBit+8*iCarry) mod c_poly
         for (int iCarry = c_nCarries;  iCarry--;)  // for each carry byte
         {
-            u8* table = m_carry[iCarry];
+            u64* table = m_carry[iCarry];
             for (int iBit = 8;  iBit--;)
             {
                 for (int iValue = 0;  iValue < c_nByteValues;  iValue++)
@@ -115,28 +123,28 @@ public:
             }
         }
 
-        u8 m_pow[c_nBits];  // 2^^(2^^i) mod c_poly
-        m_pow[0] = ((u8)1) << (c_nBits - 1 - 8); // -8 because length is in bytes not bits
+        u64 m_pow[c_nBits];  // 2^^(2^^i) mod c_poly
+        m_pow[0] = ((u64)1) << (c_nBits - 1 - 8); // -8 because length is in bytes not bits
         for (int iPow = 1;  iPow < c_nBits;  iPow++)
         {
             m_pow[iPow] = MulCarryless(m_pow[iPow-1], m_pow[iPow-1]);
         }
 
-        for (u2 iSlice = 0;  iSlice < c_nBits;  iSlice += c_nSliceBits)
+        for (u16 iSlice = 0;  iSlice < c_nBits;  iSlice += c_nSliceBits)
         {
-            u2 index = iSlice / c_nSliceBits;
-            u8* table = new u8[c_nSliceValues];
+            u16 index = iSlice / c_nSliceBits;
+            u64* table = new u64[c_nSliceValues];
             if (table == nullptr)
             {
                 fprintf(stderr, "error: crc could not allocate m_slice[%d]\n", iSlice);
                 exit(1);
             }
-            for (u8 iValue = 0;  iValue < c_nSliceValues;  iValue++)
+            for (u64 iValue = 0;  iValue < c_nSliceValues;  iValue++)
             {
                 table[iValue] = c_msb;
-                for (u8 iBit = 0;  iBit < c_nSliceBits && iSlice + iBit < c_nBits;  iBit++)
+                for (u64 iBit = 0;  iBit < c_nSliceBits && iSlice + iBit < c_nBits;  iBit++)
                 {
-                    if (iValue & (((u8)1) << iBit))
+                    if (iValue & (((u64)1) << iBit))
                     {
                         table[iValue] = MulCarryless(table[iValue], m_pow[iSlice + iBit]);
                     }
@@ -145,7 +153,8 @@ public:
             m_slice[index] = table;
         }
 
-        for (u8 iFold = 0;  iFold < c_folds;  iFold++)
+#ifdef HAS_INTRINSICS        
+        for (u64 iFold = 0;  iFold < c_folds;  iFold++)
         {
             m_fold[iFold] =  _mm_set_epi64x(
                 MulCarryless(1, Pow256(c_msb, iFold * 16 + 8)),
@@ -154,17 +163,18 @@ public:
 
         // Roll forward 16 bytes, roll back 16 bytes.  I don't know why but these are the values that work.
         m_tail = _mm_set_epi64x(
-            MulCarryless(Pow256(c_msb, u8(-1)/8 - 8), c_msb>>6), // roll back (m_tail[1])
+            MulCarryless(Pow256(c_msb, u64(-1)/8 - 8), c_msb>>6), // roll back (m_tail[1])
             MulCarryless(1, Pow256(c_msb, 8)));  // roll forward (m_tail[0])
         m_barrett = _mm_set_epi32(0, 0, 0, 0);
-        ((u8 *)&m_barrett)[0] = 0x27ecfa329aef9f77UL;  // ((2^^128 / c_poly) << 1) | 1
-        ((u8 *)&m_barrett)[1] = 0x34d926535897936aUL;  // c_msb/2
+        ((u64 *)&m_barrett)[0] = 0x27ecfa329aef9f77UL;  // ((2^^128 / c_poly) << 1) | 1
+        ((u64 *)&m_barrett)[1] = 0x34d926535897936aUL;  // c_msb/2
+#endif // HAS_INTRINSICS
     }
 
 
     ~CrcInternal()
     {
-        for (u2 x = 0;  x < c_nByteValues;  x++)  // for each first byte
+        for (u16 x = 0;  x < c_nByteValues;  x++)  // for each first byte
         {
             delete[] m_mult[x];
             m_mult[x] = nullptr;
@@ -176,7 +186,7 @@ public:
             m_carry[iCarry] = nullptr;
         }
 
-        for (u8 iSlice = 0;  iSlice < c_nSlices;  iSlice++)
+        for (u64 iSlice = 0;  iSlice < c_nSlices;  iSlice++)
         {
             delete[] m_slice[iSlice];
             m_slice[iSlice] = nullptr;
@@ -186,17 +196,17 @@ public:
 
     void InitMult()
     {
-        for (u2 x = 0;  x < c_nByteValues;  x++)  // for each first byte
+        for (u16 x = 0;  x < c_nByteValues;  x++)  // for each first byte
         {
-            u2* table = new u2[c_nByteValues];
+            u16* table = new u16[c_nByteValues];
             if (table == nullptr)
             {
                 fprintf(stderr, "could not allocate m_mult[%u]", x);
                 exit(1);
             }
-            for (u2 y = 0;  y < c_nByteValues;  y++)  // for each second byte
+            for (u16 y = 0;  y < c_nByteValues;  y++)  // for each second byte
             {
-                u2 z = 0;
+                u16 z = 0;
                 for (int iBit = 0;  iBit < 8;  iBit++)
                 {
                     if (x & (1 << iBit))
@@ -212,11 +222,11 @@ public:
 
 
     // original really slow multiplication definition
-    u8 MulPoly (u8 a, u8 b) const
+    u64 MulPoly (u64 a, u64 b) const
     {
-        u8 r;
-        u8 twiddle = c_complement;
-        u8 msb = twiddle ^ (twiddle>>1);
+        u64 r;
+        u64 twiddle = c_complement;
+        u64 msb = twiddle ^ (twiddle>>1);
 
         for (r = 0;  a != 0;  a <<= 1)
         {
@@ -234,7 +244,7 @@ public:
 
 
     // multiplication, no fancy instructions
-    u8 MulKaratsuba(u8 x, u8 y) const
+    u64 MulKaratsuba(u64 x, u64 y) const
     {
         // Use Karatsuba multiplication, table lookup
         // CRC does bits in backward order, so shift result left by 1 so 0x80*0x80 = 0x8000 not 0x4000
@@ -242,103 +252,103 @@ public:
         // *b are 2-byte products of 1-byte values
         // *c are 4-byte products of 2-byte values
         // *d are 8-byte products of 4-byte values
-        u8 x0a = x&0xff;
-        u8 x1a = (x>>8)&0xff;
-        u8 y0a = y&0xff;
-        u8 y1a = (y>>8)&0xff;
-        u8 t00b = m_mult[x0a][y0a];
-        u8 t11b = m_mult[x1a][y1a];
-        u8 t01b = m_mult[x0a ^ x1a][y0a ^ y1a] ^ t00b ^ t11b;
+        u64 x0a = x&0xff;
+        u64 x1a = (x>>8)&0xff;
+        u64 y0a = y&0xff;
+        u64 y1a = (y>>8)&0xff;
+        u64 t00b = m_mult[x0a][y0a];
+        u64 t11b = m_mult[x1a][y1a];
+        u64 t01b = m_mult[x0a ^ x1a][y0a ^ y1a] ^ t00b ^ t11b;
 
-        u8 x2a = (x>>16)&0xff;
-        u8 x3a = (x>>24)&0xff;
-        u8 y2a = (y>>16)&0xff;
-        u8 y3a = (y>>24)&0xff;
-        u8 t22b = m_mult[x2a][y2a];
-        u8 t33b = m_mult[x3a][y3a];
-        u8 t23b = m_mult[x2a ^ x3a][y2a ^ y3a] ^ t22b ^ t33b;
+        u64 x2a = (x>>16)&0xff;
+        u64 x3a = (x>>24)&0xff;
+        u64 y2a = (y>>16)&0xff;
+        u64 y3a = (y>>24)&0xff;
+        u64 t22b = m_mult[x2a][y2a];
+        u64 t33b = m_mult[x3a][y3a];
+        u64 t23b = m_mult[x2a ^ x3a][y2a ^ y3a] ^ t22b ^ t33b;
 
-        u8 x02a = x0a ^ x2a;
-        u8 x13a = x1a ^ x3a;
-        u8 y02a = y0a ^ y2a;
-        u8 y13a = y1a ^ y3a;
-        u8 t02b = m_mult[x02a][y02a];
-        u8 t13b = m_mult[x13a][y13a];
-        u8 t0123b = m_mult[x02a ^ x13a][y02a ^ y13a] ^ t02b ^ t13b;
+        u64 x02a = x0a ^ x2a;
+        u64 x13a = x1a ^ x3a;
+        u64 y02a = y0a ^ y2a;
+        u64 y13a = y1a ^ y3a;
+        u64 t02b = m_mult[x02a][y02a];
+        u64 t13b = m_mult[x13a][y13a];
+        u64 t0123b = m_mult[x02a ^ x13a][y02a ^ y13a] ^ t02b ^ t13b;
 
-        u8 t00c = t00b ^ (t01b << 8) ^ (t11b << 16);
-        u8 t22c = t22b ^ (t23b << 8) ^ (t33b << 16);
-        u8 t02c = (t02b ^ (t0123b << 8) ^ (t13b << 16)) ^ t00c ^ t22c;
+        u64 t00c = t00b ^ (t01b << 8) ^ (t11b << 16);
+        u64 t22c = t22b ^ (t23b << 8) ^ (t33b << 16);
+        u64 t02c = (t02b ^ (t0123b << 8) ^ (t13b << 16)) ^ t00c ^ t22c;
 
-        u8 t00d = t00c ^ (t02c << 16) ^ (t22c << 32);
-
-
-        u8 x4a = (x>>32)&0xff;
-        u8 x5a = (x>>40)&0xff;
-        u8 y4a = (y>>32)&0xff;
-        u8 y5a = (y>>40)&0xff;
-        u8 t44b = m_mult[x4a][y4a];
-        u8 t55b = m_mult[x5a][y5a];
-        u8 t45b = m_mult[x4a ^ x5a][y4a ^ y5a] ^ t44b ^ t55b;
-
-        u8 x6a = (x>>48)&0xff;
-        u8 x7a = (x>>56);
-        u8 y6a = (y>>48)&0xff;
-        u8 y7a = (y>>56);
-        u8 t66b = m_mult[x6a][y6a];
-        u8 t77b = m_mult[x7a][y7a];
-        u8 t67b = m_mult[x6a ^ x7a][y6a ^ y7a] ^ t66b ^ t77b;
-
-        u8 x46a = x4a ^ x6a;
-        u8 x57a = x5a ^ x7a;
-        u8 y46a = y4a ^ y6a;
-        u8 y57a = y5a ^ y7a;
-        u8 t46b = m_mult[x46a][y46a];
-        u8 t57b = m_mult[x57a][y57a];
-        u8 t4567b = m_mult[x46a ^ x57a][y46a ^ y57a] ^ t46b ^ t57b;
-
-        u8 t44c = t44b ^ (t45b << 8) ^ (t55b << 16);
-        u8 t66c = t66b ^ (t67b << 8) ^ (t77b << 16);
-        u8 t46c = (t46b ^ (t4567b << 8) ^ (t57b << 16)) ^ t44c ^ t66c;
-
-        u8 t44d = t44c ^ (t46c << 16) ^ (t66c << 32);
+        u64 t00d = t00c ^ (t02c << 16) ^ (t22c << 32);
 
 
-        u8 x04a = x0a ^ x4a;
-        u8 x15a = x1a ^ x5a;
-        u8 y04a = y0a ^ y4a;
-        u8 y15a = y1a ^ y5a;
-        u8 t04b = m_mult[x04a][y04a];
-        u8 t15b = m_mult[x15a][y15a];
-        u8 t0145b = m_mult[x04a ^ x15a][y04a ^ y15a] ^ t04b ^ t15b;
+        u64 x4a = (x>>32)&0xff;
+        u64 x5a = (x>>40)&0xff;
+        u64 y4a = (y>>32)&0xff;
+        u64 y5a = (y>>40)&0xff;
+        u64 t44b = m_mult[x4a][y4a];
+        u64 t55b = m_mult[x5a][y5a];
+        u64 t45b = m_mult[x4a ^ x5a][y4a ^ y5a] ^ t44b ^ t55b;
 
-        u8 x26a = x2a ^ x6a;
-        u8 x37a = x3a ^ x7a;
-        u8 y26a = y2a ^ y6a;
-        u8 y37a = y3a ^ y7a;
-        u8 t26b = m_mult[x26a][y26a];
-        u8 t37b = m_mult[x37a][y37a];
-        u8 t2367b = m_mult[x26a ^ x37a][y26a ^ y37a] ^ t26b ^ t37b;
+        u64 x6a = (x>>48)&0xff;
+        u64 x7a = (x>>56);
+        u64 y6a = (y>>48)&0xff;
+        u64 y7a = (y>>56);
+        u64 t66b = m_mult[x6a][y6a];
+        u64 t77b = m_mult[x7a][y7a];
+        u64 t67b = m_mult[x6a ^ x7a][y6a ^ y7a] ^ t66b ^ t77b;
 
-        u8 x0246a = x04a ^ x26a;
-        u8 x1357a = x15a ^ x37a;
-        u8 y0246a = y04a ^ y26a;
-        u8 y1357a = y15a ^ y37a;
-        u8 t0246b = m_mult[x0246a][y0246a];
-        u8 t1357b = m_mult[x1357a][y1357a];
-        u8 t01234567b = m_mult[x0246a ^ x1357a][y0246a ^ y1357a] ^ t0246b ^ t1357b;
+        u64 x46a = x4a ^ x6a;
+        u64 x57a = x5a ^ x7a;
+        u64 y46a = y4a ^ y6a;
+        u64 y57a = y5a ^ y7a;
+        u64 t46b = m_mult[x46a][y46a];
+        u64 t57b = m_mult[x57a][y57a];
+        u64 t4567b = m_mult[x46a ^ x57a][y46a ^ y57a] ^ t46b ^ t57b;
 
-        u8 t04c = t04b ^ (t0145b << 8) ^ (t15b << 16);
-        u8 t26c = t26b ^ (t2367b << 8) ^ (t37b << 16);
-        u8 t0246c = (t0246b ^ (t01234567b << 8) ^ (t1357b << 16)) ^ t04c ^ t26c;
+        u64 t44c = t44b ^ (t45b << 8) ^ (t55b << 16);
+        u64 t66c = t66b ^ (t67b << 8) ^ (t77b << 16);
+        u64 t46c = (t46b ^ (t4567b << 8) ^ (t57b << 16)) ^ t44c ^ t66c;
 
-        u8 t04d = (t04c ^ (t0246c << 16) ^ (t26c << 32)) ^ t00d ^ t44d;
+        u64 t44d = t44c ^ (t46c << 16) ^ (t66c << 32);
+
+
+        u64 x04a = x0a ^ x4a;
+        u64 x15a = x1a ^ x5a;
+        u64 y04a = y0a ^ y4a;
+        u64 y15a = y1a ^ y5a;
+        u64 t04b = m_mult[x04a][y04a];
+        u64 t15b = m_mult[x15a][y15a];
+        u64 t0145b = m_mult[x04a ^ x15a][y04a ^ y15a] ^ t04b ^ t15b;
+
+        u64 x26a = x2a ^ x6a;
+        u64 x37a = x3a ^ x7a;
+        u64 y26a = y2a ^ y6a;
+        u64 y37a = y3a ^ y7a;
+        u64 t26b = m_mult[x26a][y26a];
+        u64 t37b = m_mult[x37a][y37a];
+        u64 t2367b = m_mult[x26a ^ x37a][y26a ^ y37a] ^ t26b ^ t37b;
+
+        u64 x0246a = x04a ^ x26a;
+        u64 x1357a = x15a ^ x37a;
+        u64 y0246a = y04a ^ y26a;
+        u64 y1357a = y15a ^ y37a;
+        u64 t0246b = m_mult[x0246a][y0246a];
+        u64 t1357b = m_mult[x1357a][y1357a];
+        u64 t01234567b = m_mult[x0246a ^ x1357a][y0246a ^ y1357a] ^ t0246b ^ t1357b;
+
+        u64 t04c = t04b ^ (t0145b << 8) ^ (t15b << 16);
+        u64 t26c = t26b ^ (t2367b << 8) ^ (t37b << 16);
+        u64 t0246c = (t0246b ^ (t01234567b << 8) ^ (t1357b << 16)) ^ t04c ^ t26c;
+
+        u64 t04d = (t04c ^ (t0246c << 16) ^ (t26c << 32)) ^ t00d ^ t44d;
 
 
         // low 64-bits and high 64-bits, before carries
         // CRC multiply does bits in backwards order, so 0x80*0x80 should be 0x8000 not 0x4000, so shift left by 1
-        u8 rLo = (t00d << 1) ^ (t04d << 33);
-        u8 rHi = (t04d >> 31) ^ (t44d << 1);
+        u64 rLo = (t00d << 1) ^ (t04d << 33);
+        u64 rHi = (t04d >> 31) ^ (t44d << 1);
 
         return
             rHi ^
@@ -353,9 +363,9 @@ public:
     }
 
 
-    u8 MulCarryless(u8 a, u8 b) const
+    u64 MulCarryless(u64 a, u64 b) const
     {
-#ifdef USE_KARATSUBA
+#ifndef HAS_INTRINSICS
         return MulKaratsuba(a, b);
 #else
         // calculate the full z=x*y, not mod anything
@@ -363,10 +373,10 @@ public:
         __m128i yy = Set128(0, b);
         __m128i zz = _mm_clmulepi64_si128(xx,yy,0x00);
 
-        u8 rLo0 = ((u8 *)&zz)[0];
-        u8 rHi0 = ((u8 *)&zz)[1];
-        u8 rLo = rLo0 << 1;
-        u8 rHi = (rLo0 >> 63) ^ (rHi0 << 1);
+        u64 rLo0 = ((u64 *)&zz)[0];
+        u64 rHi0 = ((u64 *)&zz)[1];
+        u64 rLo = rLo0 << 1;
+        u64 rHi = (rLo0 >> 63) ^ (rHi0 << 1);
 
         return
             rHi ^
@@ -378,19 +388,19 @@ public:
             m_carry[2][(rLo>>16)&0xff] ^
             m_carry[1][(rLo>>8)&0xff] ^
             m_carry[0][rLo&0xff];
-#endif
+#endif // HAS_INTRINSICS
     }
 
     // compute the CRC a byte at a time using MulPoly()
-    u8 ComputePoly(
+    u64 ComputePoly(
         const void* pSrc,
-        u8 uSize,
-        u8 uCrc) const
+        u64 uSize,
+        u64 uCrc) const
     {
-        u8 crc = ~uCrc;
-        for (u8 i = 0;  i < uSize;  i++)
+        u64 crc = ~uCrc;
+        for (u64 i = 0;  i < uSize;  i++)
         {
-            crc ^= u8(((u1 *)pSrc)[i]);
+            crc ^= u64(((u8 *)pSrc)[i]);
             crc = MulPoly(crc, 0x80000000000000);
         }
         return ~crc;
@@ -398,7 +408,7 @@ public:
 
 
     // multiply A by (256 to the Bth power)
-    u8 Pow256(u8 a, u8 b) const
+    u64 Pow256(u64 a, u64 b) const
     {
         for (int iSlice = 0;  b > 0;  iSlice++)
         {
@@ -408,6 +418,7 @@ public:
         return a;
     }
 
+#ifdef HAS_INTRINSICS
 
 #define STEP(index, offset, sum) \
     fold = m_fold[index]; \
@@ -448,12 +459,12 @@ public:
     // Compute() is about 10x times slower per byte for 2-byte inputs than 2-million-byte inputs, and
     // calling Compute() for very small values is unfortunately very common, so this makes an effort
     // to make very small keys as fast as possible.  For very big keys only the while-loop matters.
-    u8 Compute(
+    u64 Compute(
         const void* pSrc,
-        u8 uSize,
-        u8 uCrc) const
+        u64 uSize,
+        u64 uCrc) const
     {
-        u1* pData = (u1 *)pSrc;
+        u8* pData = (u8 *)pSrc;
 
         uCrc = ~uCrc;
 
@@ -515,7 +526,7 @@ public:
             // Out: state in z, with last 8 bytes in z0.
             x = _mm_set_epi32(0,0,0,0);
             xx = _mm_set_epi32(0,0,0,0);
-            u8 tail16 = (uSize-1) & ~u8(0xf); // all but the last 1..16 bytes
+            u64 tail16 = (uSize-1) & ~u64(0xf); // all but the last 1..16 bytes
             pData += tail16-16;
             uSize -= tail16;
             switch (tail16/16)  // cases purposely fall through
@@ -733,7 +744,7 @@ public:
         }
         case 15:
         {
-            uCrc ^= *(u8 *)pData;
+            uCrc ^= *(u64 *)pData;
             uCrc = m_carry[0][uCrc & 0xff] ^
                 m_carry[1][(uCrc >> 8) & 0xff] ^
                 m_carry[2][(uCrc >> 16) & 0xff] ^
@@ -742,7 +753,7 @@ public:
                 m_carry[5][(uCrc >> 40) & 0xff] ^
                 m_carry[6][(uCrc >> 48) & 0xff] ^
                 m_carry[7][uCrc >> 56];
-            u8 x = *(u8 *)(&pData[uSize-8]) ^ (uCrc << 8);
+            u64 x = *(u64 *)(&pData[uSize-8]) ^ (uCrc << 8);
             uCrc = (uCrc >> 56) ^ 
                 m_carry[1][(x >> 8) & 0xff] ^
                 m_carry[2][(x >> 16) & 0xff] ^
@@ -755,7 +766,7 @@ public:
         }
         case 14:
         {
-            uCrc ^= *(u8 *)pData;
+            uCrc ^= *(u64 *)pData;
             uCrc = m_carry[0][uCrc & 0xff] ^
                 m_carry[1][(uCrc >> 8) & 0xff] ^
                 m_carry[2][(uCrc >> 16) & 0xff] ^
@@ -764,7 +775,7 @@ public:
                 m_carry[5][(uCrc >> 40) & 0xff] ^
                 m_carry[6][(uCrc >> 48) & 0xff] ^
                 m_carry[7][uCrc >> 56];
-            u8 x = *(u8 *)(&pData[uSize-8]) ^ (uCrc << 16);
+            u64 x = *(u64 *)(&pData[uSize-8]) ^ (uCrc << 16);
             uCrc = (uCrc >> 48) ^ 
                 m_carry[2][(x >> 16) & 0xff] ^
                 m_carry[3][(x >> 24) & 0xff] ^
@@ -776,7 +787,7 @@ public:
         }
         case 13:
         {
-            uCrc ^= *(u8 *)pData;
+            uCrc ^= *(u64 *)pData;
             uCrc = m_carry[0][uCrc & 0xff] ^
                 m_carry[1][(uCrc >> 8) & 0xff] ^
                 m_carry[2][(uCrc >> 16) & 0xff] ^
@@ -785,7 +796,7 @@ public:
                 m_carry[5][(uCrc >> 40) & 0xff] ^
                 m_carry[6][(uCrc >> 48) & 0xff] ^
                 m_carry[7][uCrc >> 56];
-            u8 x = *(u8 *)(&pData[uSize-8]) ^ (uCrc << 24);
+            u64 x = *(u64 *)(&pData[uSize-8]) ^ (uCrc << 24);
             uCrc = (uCrc >> 40) ^ 
                 m_carry[3][(x >> 24) & 0xff] ^
                 m_carry[4][(x >> 32) & 0xff] ^
@@ -796,7 +807,7 @@ public:
         }
         case 12:
         {
-            uCrc ^= *(u8 *)pData;
+            uCrc ^= *(u64 *)pData;
             uCrc = m_carry[0][uCrc & 0xff] ^
                 m_carry[1][(uCrc >> 8) & 0xff] ^
                 m_carry[2][(uCrc >> 16) & 0xff] ^
@@ -805,7 +816,7 @@ public:
                 m_carry[5][(uCrc >> 40) & 0xff] ^
                 m_carry[6][(uCrc >> 48) & 0xff] ^
                 m_carry[7][uCrc >> 56];
-            uCrc ^= *((u4 *)&pData[8]);
+            uCrc ^= *((u32 *)&pData[8]);
             uCrc = (uCrc >> 32) ^
                 m_carry[4][uCrc & 0xff] ^
                 m_carry[5][(uCrc >> 8) & 0xff] ^
@@ -815,7 +826,7 @@ public:
         }
         case 11:
         {
-            uCrc ^= *(u8 *)pData;
+            uCrc ^= *(u64 *)pData;
             uCrc = m_carry[0][uCrc & 0xff] ^
                 m_carry[1][(uCrc >> 8) & 0xff] ^
                 m_carry[2][(uCrc >> 16) & 0xff] ^
@@ -824,7 +835,7 @@ public:
                 m_carry[5][(uCrc >> 40) & 0xff] ^
                 m_carry[6][(uCrc >> 48) & 0xff] ^
                 m_carry[7][uCrc >> 56];
-            u8 x = *(u8 *)(&pData[uSize-8]) ^ (uCrc << 40);
+            u64 x = *(u64 *)(&pData[uSize-8]) ^ (uCrc << 40);
             uCrc = (uCrc >> 24) ^ 
                 m_carry[5][(x >> 40) & 0xff] ^
                 m_carry[6][(x >> 48) & 0xff] ^
@@ -833,7 +844,7 @@ public:
         }
         case 10:
         {
-            uCrc ^= *(u8 *)pData;
+            uCrc ^= *(u64 *)pData;
             uCrc = m_carry[0][uCrc & 0xff] ^
                 m_carry[1][(uCrc >> 8) & 0xff] ^
                 m_carry[2][(uCrc >> 16) & 0xff] ^
@@ -842,7 +853,7 @@ public:
                 m_carry[5][(uCrc >> 40) & 0xff] ^
                 m_carry[6][(uCrc >> 48) & 0xff] ^
                 m_carry[7][uCrc >> 56];
-            uCrc ^= *((u2 *)&pData[8]);
+            uCrc ^= *((u16 *)&pData[8]);
             uCrc = (uCrc >> 16) ^
                 m_carry[6][uCrc & 0xff] ^
                 m_carry[7][(uCrc >> 8) & 0xff];
@@ -853,7 +864,7 @@ public:
             // fall through
         case 8:
         {
-            uCrc ^= *(u8 *)pData;
+            uCrc ^= *(u64 *)pData;
             uCrc = m_carry[0][uCrc & 0xff] ^
                 m_carry[1][(uCrc >> 8) & 0xff] ^
                 m_carry[2][(uCrc >> 16) & 0xff] ^
@@ -869,13 +880,13 @@ public:
             // fall through
         case 6:
         {
-            uCrc ^= *((u4 *)pData);
+            uCrc ^= *((u32 *)pData);
             uCrc = (uCrc >> 32) ^
                 m_carry[4][uCrc & 0xff] ^
                 m_carry[5][(uCrc >> 8) & 0xff] ^
                 m_carry[6][(uCrc >> 16) & 0xff] ^
                 m_carry[7][(uCrc >> 24) & 0xff];
-            uCrc ^= *((u2 *)&pData[4]);
+            uCrc ^= *((u16 *)&pData[4]);
             uCrc = (uCrc >> 16) ^
                 m_carry[6][uCrc & 0xff] ^
                 m_carry[7][(uCrc >> 8) & 0xff];
@@ -886,7 +897,7 @@ public:
             // fall through
         case 4:
         {
-            uCrc ^= *((u4 *)pData);
+            uCrc ^= *((u32 *)pData);
             uCrc = (uCrc >> 32) ^
                 m_carry[4][uCrc & 0xff] ^
                 m_carry[5][(uCrc >> 8) & 0xff] ^
@@ -899,7 +910,7 @@ public:
             // fall through
         case 2:
         {
-            uCrc ^= *((u2 *)pData);
+            uCrc ^= *((u16 *)pData);
             uCrc = (uCrc >> 16) ^
                 m_carry[6][uCrc & 0xff] ^
                 m_carry[7][(uCrc >> 8) & 0xff];
@@ -918,17 +929,33 @@ public:
 
 #undef STEP
 
+#else // not HAS_INTRINSICS
 
-    u8 Concat(
-        u8 uInitialCrcAB,
-        u8 uInitialCrcA,
-        u8 uFinalCrcA,
-        u8 uSizeA,
-        u8 uInitialCrcB,
-        u8 uFinalCrcB,
-        u8 uSizeB) const
+    u64 Compute(
+        const void* pSrc,
+        u64 uSize,
+        u64 uCrc) const
     {
-        u8 state = 0;
+        u8* pData = (u8 *)pSrc;
+        uCrc = ~uCrc;
+        for (u64 i = 0; i < uSize; i++)
+            uCrc = (uCrc >> 8) ^ m_carry[7][(uCrc & 0xff) ^ *pData++];
+        return ~uCrc;
+    }
+
+#endif // HAS_INTRINSICS
+
+
+    u64 Concat(
+        u64 uInitialCrcAB,
+        u64 uInitialCrcA,
+        u64 uFinalCrcA,
+        u64 uSizeA,
+        u64 uInitialCrcB,
+        u64 uFinalCrcB,
+        u64 uSizeB) const
+    {
+        u64 state = 0;
         // Start the CRC before A.  Start with uInitialCrcAB and cancel out uInitialCrcA.
         if (uInitialCrcAB != uInitialCrcA)
         {
@@ -955,18 +982,20 @@ public:
     // If a machine has hardware memory corruptions, it could compute concat wrong.  This will detect that.
     const char* MemoryCheck() const
     {
-        u8 a = 0;
+        u64 a = 0;
         const char* rsl = nullptr;
+#ifdef HAS_INTRINSICS
         a = Compute(m_tab, sizeof(m_tab), a);
         if (a != 0xf6eb8d32169ecb54)
         {
             printf("tab %lx\n", a);
             rsl = "m_tab corrupt";
         }
+#endif
 
         a = 0;
         for (int i = 0;  i < c_nCarries;  i++)
-            a = Compute(m_carry[i], sizeof(u8)*c_nByteValues, a);
+            a = Compute(m_carry[i], sizeof(u64)*c_nByteValues, a);
         if (a != 0xf5118d5f47061a81)
         {
             printf("carry %lx\n", a);
@@ -979,7 +1008,7 @@ public:
 
             for (int i = 0;  i < c_nByteValues;  i++)
             {
-                a = Compute(m_mult[i], sizeof(u2)*c_nByteValues, a);
+                a = Compute(m_mult[i], sizeof(u16)*c_nByteValues, a);
             }
 
             if (a != 0x63512d28f5b05fcf)
@@ -992,7 +1021,7 @@ public:
         a = 0;
         for (int i = 0;  i < c_nBits/c_nSliceBits;  i++)
         {
-            a = Compute(m_slice[i], sizeof(u8)*c_nSliceValues, a);
+            a = Compute(m_slice[i], sizeof(u64)*c_nSliceValues, a);
         }
         if (a != 0x819849c4eb74f7ab)
         {
@@ -1003,7 +1032,7 @@ public:
         return rsl;
     }
 
-    static u8 Mix(u8 x)
+    static u64 Mix(u64 x)
     {
         x ^= ~(x >> 32);
         x *= 0xdeadbeefdeadbeef;
@@ -1015,21 +1044,22 @@ public:
     // return true if successful
     bool SelfTest()
     {
+        // make sure m_mult is defined
+        if (m_mult[0] == nullptr)
+        {
+            InitMult();
+        }
+
         // do a test of crc64nvme you can verify from the internet
-        u8 crc = g_crc->Compute("hello world!", 12, 0);
-        u8 expected = 0xd9160d1fa8e418e3;
+        u64 crc = g_crc->Compute("hello world!", 12, 0);
+        u64 expected = 0xd9160d1fa8e418e3;
         if (crc != expected)
         {
             fprintf(stderr, "hello world! got %lx expected %lx\n", crc, expected);
             return false;
         }
 
-        // check the multiplications are equivalent        
-        if (m_mult[0] != nullptr)
-        {
-            InitMult();
-        }
-        u8 x = 0xc01105a1deadbeef;
+        u64 x = 0xc01105a1deadbeef;
         if (MulPoly(crc, x) != MulCarryless(crc, x))
         {
             fprintf(stderr, "MulPoly, MulCarryless inconsistent\n");
@@ -1042,16 +1072,16 @@ public:
         }
 
         // fill a midsized buffer with predictable noise
-        static const u8 c_buflen = 1000;
-        u8 buf[c_buflen];
-        for (u8 i = 0; i < c_buflen; i++)
+        static const u64 c_buflen = 1000;
+        u64 buf[c_buflen];
+        for (u64 i = 0; i < c_buflen; i++)
         {
             buf[i] = x;
             x = Mix(x);
         }
 
         // test complicated Compute() matches simple ComputePoly()
-        for (u8 i = 0; i < c_buflen * sizeof(u8); i++)
+        for (u64 i = 0; i < c_buflen * sizeof(u64); i++)
         {
             if (ComputePoly(buf, i, 0) != Compute(buf, i, 0))
             {
@@ -1065,54 +1095,54 @@ public:
             }
         }
 
-        u8 zeroCrc = Compute(buf, 0, 0);
+        u64 zeroCrc = Compute(buf, 0, 0);
         if (zeroCrc != Concat(0, 0, zeroCrc, 0, 0, zeroCrc, 0))
         {
             fprintf(stderr, "Concat of nulls failed\n");
             return false;
         }
 
-        u8 bufcrc = Compute(buf, c_buflen*sizeof(u8), 0);
-        for (u8 i = 0;  i < c_buflen * sizeof(u8); i++)
+        u64 bufcrc = Compute(buf, c_buflen*sizeof(u64), 0);
+        for (u64 i = 0;  i < c_buflen * sizeof(u64); i++)
         {
-            u8 a = Compute(buf, i, 0);
-            u8 b = Compute(((u1 *)buf)+i, c_buflen*sizeof(u8)-i, 0);
-            if (Concat(0, 0, a, i, 0, b, c_buflen*sizeof(u8)-i) != bufcrc)
+            u64 a = Compute(buf, i, 0);
+            u64 b = Compute(((u8 *)buf)+i, c_buflen*sizeof(u64)-i, 0);
+            if (Concat(0, 0, a, i, 0, b, c_buflen*sizeof(u64)-i) != bufcrc)
             {
                 fprintf(stderr, "Concat does not match Compute\n");
                 return false;
             }
         }
 
-        for (u8 i = 0;  i < 100;  i++)
+        for (u64 i = 0;  i < 100;  i++)
         {
             // a b c are 8-byte integers, a <= b <= c
-            u8 a = x;  x = Mix(x);
-            u8 b = x;  x = Mix(x);
-            u8 c = x;  x = Mix(x);
-            if (a > b) { u8 temp = a; a = b; b = temp; }
-            if (a > c) { u8 temp = a; a = c; c = temp; }
-            if (b > c) { u8 temp = b; b = c; c = temp; }
+            u64 a = x;  x = Mix(x);
+            u64 b = x;  x = Mix(x);
+            u64 c = x;  x = Mix(x);
+            if (a > b) { u64 temp = a; a = b; b = temp; }
+            if (a > c) { u64 temp = a; a = c; c = temp; }
+            if (b > c) { u64 temp = b; b = c; c = temp; }
 
             // a+d+e = c
-            u8 d = b-a;
-            u8 e = c-b;
+            u64 d = b-a;
+            u64 e = c-b;
             if (a+d+e != c) printf("hi bob\n");
 
             // starting and ending CRCs for a, d, e, ad, de
-            u8 a0 = x;  x = Mix(x);
-            u8 a1 = x;  x = Mix(x);
-            u8 d0 = x;  x = Mix(x);
-            u8 d1 = x;  x = Mix(x);
-            u8 e0 = x;  x = Mix(x);
-            u8 e1 = x;  x = Mix(x);
-            u8 ad0 = x;  x = Mix(x);
-            u8 ad1 = Concat(ad0, a0, a1, a, d0, d1, d);
-            u8 de0 = x;  x = Mix(x);
-            u8 de1 = Concat(de0, d0, d1, d, e0, e1, e);
+            u64 a0 = x;  x = Mix(x);
+            u64 a1 = x;  x = Mix(x);
+            u64 d0 = x;  x = Mix(x);
+            u64 d1 = x;  x = Mix(x);
+            u64 e0 = x;  x = Mix(x);
+            u64 e1 = x;  x = Mix(x);
+            u64 ad0 = x;  x = Mix(x);
+            u64 ad1 = Concat(ad0, a0, a1, a, d0, d1, d);
+            u64 de0 = x;  x = Mix(x);
+            u64 de1 = Concat(de0, d0, d1, d, e0, e1, e);
 
             // starting CRC for a+d+e=c
-            u8 c0 = x;  x = Mix(x);
+            u64 c0 = x;  x = Mix(x);
             
             if (Concat(c0, a0, a1, a, de0, de1, d+e) !=
                 Concat(c0, ad0, ad1, a+d, e0, e1, e))
@@ -1123,6 +1153,96 @@ public:
         }
         
         return true;
+    }
+
+    void TimingTest()
+    {
+        // make sure m_mult is defined
+        if (m_mult[0] == nullptr)
+        {
+            InitMult();
+        }
+
+        u64 iter = 10000000;
+        u64 x = 0xdeadbeefdeadbeef;
+        auto a = std::chrono::high_resolution_clock::now();
+        for (u64 i = 0; i < iter; i++)
+            x += MulCarryless(x, 0xdeadbeefdeadbeef); 
+        auto z = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> d = z - a;
+        fprintf(stderr, "MulCarryless() (SIMD instructions) took %g microseconds %lx\n",
+                d.count()*1000000/iter, x);
+
+        iter = 10000000;
+        x = 0xdeadbeefdeadbeef;
+        a = std::chrono::high_resolution_clock::now();
+        for (u64 i = 0; i < iter; i++)
+            x += MulKaratsuba(x, 0xdeadbeefdeadbeef); 
+        z = std::chrono::high_resolution_clock::now();
+        d = z - a;
+        fprintf(stderr, "MulKaratsuba() (no SIMD) took %g microseconds %lx\n",
+                d.count()*1000000/iter, x);
+        
+        const u64 c_bufLen = 1<<16;
+        char buf[c_bufLen];
+        for (u64 i = 0; i < c_bufLen; i++)
+            buf[i] = (char)(i + d.count());
+
+        iter = 10000;
+        x = 0;
+        a = std::chrono::high_resolution_clock::now();
+        for (u64 i = 0; i < iter; i++)
+            x += ComputePoly(buf, 256, x); 
+        z = std::chrono::high_resolution_clock::now();
+        d = z - a;
+        fprintf(stderr, "ComputePoly() (slow) of 256 byte buffer took %g microseconds %lx\n",
+                d.count()*1000000/iter, x);
+
+        iter = 10000;
+        x = 0;
+        a = std::chrono::high_resolution_clock::now();
+        for (u64 i = 0; i < iter; i++)
+            x += Compute(buf, 256, x); 
+        z = std::chrono::high_resolution_clock::now();
+        d = z - a;
+        fprintf(stderr, "Compute() of 256 byte buffer took %g microseconds %lx\n",
+                d.count()*1000000/iter, x);
+
+        a = std::chrono::high_resolution_clock::now();
+        x = 0;
+        iter = 10000000;
+        for (u64 i = 0; i < iter; i++)
+            x += Concat(i, i, x, i, i, x, i);
+        z = std::chrono::high_resolution_clock::now();
+        d = z - a;
+        fprintf(stderr, "Concat() took %g microseconds %lu\n\n",
+                d.count()*1000000/iter, x);
+
+        for (u64 len = 0; len < 32; len++)
+        {
+            iter = 1000000;
+            x = 0;
+            a = std::chrono::high_resolution_clock::now();
+            for (u64 i = 0; i < iter; i++)
+                x += Compute(buf, len, x); 
+            z = std::chrono::high_resolution_clock::now();
+            d = z - a;
+            fprintf(stderr, "Compute() of %lu byte buffer took %g microseconds %lx\n",
+                    len, d.count()*1000000/iter, x);
+        }
+
+        for (u64 len = 1; len <= 1<<16; len *= 2)
+        {
+            iter = 1000000/len;
+            x = 0;
+            a = std::chrono::high_resolution_clock::now();
+            for (u64 i = 0; i < iter; i++)
+                x += Compute(buf, len, x); 
+            z = std::chrono::high_resolution_clock::now();
+            d = z - a;
+            fprintf(stderr, "Compute() of %lu byte buffer took %g microseconds %lx\n",
+                    len, d.count()*1000000/iter, x);
+        }
     }
 };
 
@@ -1135,7 +1255,7 @@ Crc::Crc()
         fprintf(stderr, "error: crc, could not init internal\n");
         exit(1);
     }
-#ifdef USE_KARATSUBA
+#ifndef HAS_INTRINSICS
     m_internal->InitMult();
 #endif
     const char* errMessage = MemoryCheck();
@@ -1151,15 +1271,15 @@ Crc::~Crc()
     delete m_internal;
 }
 
-u8 Crc::Compute(
+u64 Crc::Compute(
     const void* pSrc,
-    u8 uSize,
-    u8 uCrc) const
+    u64 uSize,
+    u64 uCrc) const
 {
     return m_internal->Compute(pSrc, uSize, uCrc);
 }
 
-u8 Crc::Concat(u8 iab, u8 ia, u8 fa, u8 sa, u8 ib, u8 fb, u8 sb) const
+u64 Crc::Concat(u64 iab, u64 ia, u64 fa, u64 sa, u64 ib, u64 fb, u64 sb) const
 {
     return m_internal->Concat(iab, ia, fa, sa, ib, fb, sb);
 }
@@ -1172,4 +1292,9 @@ const char* Crc::MemoryCheck() const
 bool Crc::SelfTest() const
 {
     return m_internal->SelfTest();
+}
+
+void Crc::TimingTest() const
+{
+    m_internal->TimingTest();
 }
