@@ -8,7 +8,7 @@ Comparison of CRC-64-NVME implementations on AMD Ryzen 7 5825U.
 ## Implementations Tested
 
 1. **Bob Jenkins' C++ (reference)** - Original implementation from burtleburtle.net
-2. **Our Rust Implementation (Laws)** - Direct translation of Jenkins' C++
+2. **Our Rust Implementation** - Direct translation of Jenkins' C++
 3. **crc64fast-nvme** - Popular Rust crate (now deprecated)
 
 ## Test Methodology
@@ -64,7 +64,7 @@ Comparison of CRC-64-NVME implementations on AMD Ryzen 7 5825U.
 | Implementation | Time (µs) | Throughput (GB/s) | vs C++ |
 |----------------|-----------|-------------------|--------|
 | Bob Jenkins' C++ | 3.80 | **17.24** | 100% |
-| Our Rust (Laws) | 4.02 | **16.30** | 95% |
+| Our Rust | 4.02 | **16.30** | 95% |
 | crc64fast-nvme | 4.12 | **15.91** | 92% |
 
 All three implementations are excellent and within 8% of each other.
