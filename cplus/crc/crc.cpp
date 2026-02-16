@@ -4,7 +4,7 @@
 #include <cstring>
 #if defined(__SSE__) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1) || defined(_M_X64)
 #  include <x86intrin.h>
-// #  define HAS_INTRINSICS
+#  define HAS_INTRINSICS
 #endif
 
 #ifndef nullptr
