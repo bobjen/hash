@@ -938,7 +938,21 @@ public:
     {
         u8* pData = (u8 *)pSrc;
         uCrc = ~uCrc;
-        for (u64 i = 0; i < uSize; i++)
+        u64 remainder = uSize;
+        for (; remainder >= 8; remainder -= 8)
+        {
+            uCrc ^= *(u64 *)pData;
+            uCrc = m_carry[0][uCrc & 0xff] ^
+                m_carry[1][(uCrc >> 8) & 0xff] ^
+                m_carry[2][(uCrc >> 16) & 0xff] ^
+                m_carry[3][(uCrc >> 24) & 0xff] ^
+                m_carry[4][(uCrc >> 32) & 0xff] ^
+                m_carry[5][(uCrc >> 40) & 0xff] ^
+                m_carry[6][(uCrc >> 48) & 0xff] ^
+                m_carry[7][uCrc >> 56];
+            pData += 8;
+        }
+        while (remainder--)
             uCrc = (uCrc >> 8) ^ m_carry[7][(uCrc & 0xff) ^ *pData++];
         return ~uCrc;
     }
