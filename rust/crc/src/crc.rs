@@ -1,7 +1,7 @@
 //! # CRC-64-NVME: High-Performance 64-bit Cyclic Redundancy Check
 //!
 //! Fast implementation of CRC-64 using the NVMe polynomial for detecting data corruption.
-//! Translated from Bob Jenkins' public domain C++ implementation.
+//! Translated from Bob Jenkins' public domain C++ implementation by Claude Sonnet 4.5
 //!
 //! ## How to Extract as Standalone Module
 //!
@@ -162,7 +162,7 @@
 //! - **Width**: 64 bits
 //! - **Initial value**: 0xFFFFFFFFFFFFFFFF (inverted)
 //! - **Final XOR**: 0xFFFFFFFFFFFFFFFF (inverted)
-//! - **Reflection**: Input and output not reflected
+//! - **Reflection**: yes, each new byte shifts right not left
 //!
 //! ## References
 //!
@@ -386,11 +386,11 @@ impl Crc {
     /// let crc = Crc::new();
     ///
     /// // Simple CRC
-    /// let checksum = crc.compute(b"hello world", 0);
+    /// let checksum = crc.compute(b"hello world!", 0);
     ///
-    /// // Chained CRC (equivalent to computing CRC of "helloworld")
+    /// // Chained CRC (equivalent to computing CRC of "hello world!")
     /// let crc1 = crc.compute(b"hello", 0);
-    /// let crc2 = crc.compute(b"world", crc1);
+    /// let crc2 = crc.compute(b" world!", crc1);
     /// ```
     #[cfg(target_arch = "x86_64")]
     pub fn compute(&self, src: &[u8], init_crc: u64) -> u64 {

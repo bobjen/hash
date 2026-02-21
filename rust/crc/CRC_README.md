@@ -1,20 +1,19 @@
 # CRC-64-NVME: High-Performance 64-bit Cyclic Redundancy Check
 
-Fast, production-ready implementation of CRC-64 using the NVMe polynomial for detecting data corruption.
+Fast implementation of CRC-64 using the NVMe polynomial for detecting data corruption on Intel and AMD CPUs.
 
 ## Performance
 
 - **16 GB/s throughput** on typical CPUs (AMD Ryzen 7 5825U tested)
 - **~5-10 ns** for 1-16 byte inputs (optimized fast path)
-- **O(log n) concatenation** instead of O(n) recomputation
+- **Concat(A,B)** finds the CRC of A+B and costs as much as Compute() on a 128-byte key
 
 ## Features
 
-✅ **Optimized for small values** - Common case (1-16 bytes) has dedicated fast paths
+✅ **Optimized for small values**
 ✅ **SIMD acceleration** - Uses PCLMULQDQ (carryless multiply) instructions
-✅ **Fast concatenation** - Merge CRCs without recomputing (~100ns regardless of data size)
-✅ **Instruction-level parallelism** - Dual-track processing maximizes throughput
-✅ **Production-ready** - Comprehensive tests, correct implementation
+✅ **Fast concatenation** - Merge CRCs without recomputing (~100ns)
+✅ **Single threaded**
 ✅ **Zero dependencies** - Only uses `std::arch::x86_64` intrinsics
 
 ## Quick Start
@@ -25,16 +24,16 @@ use common::crc::Crc;
 let crc = Crc::new();
 
 // Compute CRC
-let data = b"hello world";
+let data = b"hello world!";
 let checksum = crc.compute(data, 0);
 
 // Verify integrity
-let received = b"hello world";
+let received = b"hello world!";
 assert_eq!(crc.compute(received, 0), checksum);
 
 // Fast concatenation (O(log n))
 let part1 = b"hello";
-let part2 = b" world";
+let part2 = b" world!";
 let crc1 = crc.compute(part1, 0);
 let crc2 = crc.compute(part2, 0);
 let combined = crc.concat(0, 0, crc1, part1.len() as u64,
@@ -53,12 +52,12 @@ This is a **self-contained, single-file implementation**:
    [target.x86_64-unknown-linux-gnu]
    rustflags = ["-C", "target-cpu=native"]
    ```
-4. No external dependencies!
 
 ## When to Use CRC
 
 ✅ **Good for:**
 - Detecting transmission errors
+- Detecting bugs
 - Storage bit flips
 - Memory corruption
 - Hardware failures
@@ -68,17 +67,6 @@ This is a **self-contained, single-file implementation**:
 - Detecting malicious tampering
 - Use SHA-256, BLAKE3, etc. for security
 
-## When to Use concat() vs compute()
-
-**Critical threshold: 128 bytes**
-
-| Data Size | Use | Time | Advantage |
-|-----------|-----|------|-----------|
-| < 128 bytes | `compute()` | ~8 ns | Faster & simpler |
-| ≥ 128 bytes | `concat()` | ~9 ns | Faster & constant time |
-| 1 KB | `concat()` | ~9 ns | **7x faster** than compute |
-| 64 KB | `concat()` | ~9 ns | **430x faster** than compute |
-
 ### Why concat() Is So Fast
 
 `concat()` takes only **~9 ns** regardless of data size because:
@@ -87,60 +75,30 @@ This is a **self-contained, single-file implementation**:
 - Only ~8 multiplications total (O(log n))
 - **No memory access to the actual data!**
 
-This makes updating large files incredibly efficient:
+This makes adding to large files incredibly efficient:
 ```
-1 GB file, 1 KB changed:
+1 GB file, 1 KB added:
 - Naive recompute: ~60,000,000 ns
 - With concat():  ~73 ns (800,000x faster!)
 ```
 
-## Usage Patterns
+### When to Use concat() vs compute()
 
-### Simple Checksums
-```rust
-let crc = Crc::new();
-let data = read_file()?;
-let checksum = crc.compute(&data, 0);
-store_checksum(checksum);
-```
+| Data Size | compute() | concat() | Winner |
+|-----------|-----------|----------|--------|
+| 64 bytes  | ~8.6 ns   | ~9.4 ns  | compute() |
+| 128 bytes | ~9.5 ns   | ~9.4 ns  | **breakeven** |
+| 1 KB      | ~64 ns    | ~9 ns    | concat() (7x faster) |
+| 64 KB     | ~3900 ns  | ~9 ns    | concat() (430x faster) |
 
-### Incremental Checksums
-Trade off overhead vs. granularity:
-- Every 1KB: 0.8% overhead
-- Every 10KB: 0.08% overhead
-- Every 80KB: 0.01% overhead
-
-```rust
-for chunk in data.chunks(1024) {
-    let chunk_crc = crc.compute(chunk, 0);
-    store_crc_entry(chunk_crc);
-}
-```
-
-### Parallel Processing
-```rust
-use std::thread;
-
-let mid = data.len() / 2;
-
-// Process in parallel
-let h1 = thread::spawn(move || crc.compute(&data[..mid], 0));
-let h2 = thread::spawn(move || crc.compute(&data[mid..], 0));
-
-let crc1 = h1.join().unwrap();
-let crc2 = h2.join().unwrap();
-
-// Fast merge with concat()
-let combined = crc.concat(0, 0, crc1, mid as u64,
-                          0, crc2, (data.len() - mid) as u64);
-```
+Rule of thumb: use concat() for data ≥ 128 bytes.
 
 ## Algorithm Details
 
 - **Polynomial**: `0x9a6c9329ac4bc9b5` (CRC-64-NVME)
 - **Width**: 64 bits
 - **Initial/Final XOR**: `0xFFFFFFFFFFFFFFFF` (inverted)
-- **Reflection**: Not reflected
+- **Reflection**: Yes, every new byte shifts right not left
 
 ## Why This Is Fast
 
@@ -151,7 +109,7 @@ let combined = crc.concat(0, 0, crc1, mid as u64,
 
 ## References
 
-- **Original**: Bob Jenkins' public domain C++ implementation
+- **Original**: Bob Jenkins' C++ implementation, https://github.com/bobjen/hash/cplus/crc
 - **Design notes**: https://burtleburtle.net/bob/hash/crc.html
 - **NVMe spec**: https://nvmexpress.org/
 
