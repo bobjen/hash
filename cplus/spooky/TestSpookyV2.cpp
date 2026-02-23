@@ -1,7 +1,8 @@
 #include "SpookyV2.h"
 #include <stdio.h>
-#include <stddef.h>
-#include <windows.h>
+#include <stdlib.h>
+#include <chrono>
+#include <cstring>
 
 class Random
 { 
@@ -137,7 +138,7 @@ void TestResults()
         saw[i] = SpookyHash::Hash32(buf, i, 0);
         if (saw[i] != expected[i])
         {
-  	    printf("%3d: saw 0x%.8lx, expected 0x%.8lx\n", i, saw[i], expected[i]);
+            printf("%3d: saw 0x%.8x, expected 0x%.8lx\n", i, saw[i], expected[i]);
         }
     }
 }
@@ -157,39 +158,43 @@ void DoTimingBig(int seed)
         memset(buf[i], (char)seed, BUFSIZE);
     }
     
-    uint64 a = GetTickCount();
+    auto a = std::chrono::high_resolution_clock::now();
     uint64 hash1 = seed;
     uint64 hash2 = seed;
     for (uint64 i=0; i<NUMBUF; ++i)
     {
-	SpookyHash::Hash128(buf[i], BUFSIZE, &hash1, &hash2);
+        SpookyHash::Hash128(buf[i], BUFSIZE, &hash1, &hash2);
     }
-    uint64 z = GetTickCount();
-    printf("SpookyHash::Hash128, uncached: time is %4lld milliseconds\n", z-a);
+    auto z = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> d = z - a;
+    printf("SpookyHash::Hash128, uncached: time is %4g milliseconds\n", d.count()*1000);
 
-    a = GetTickCount();
+    a = std::chrono::high_resolution_clock::now();
     for (uint64 i=0; i<NUMBUF; ++i)
     {
-	Add(buf[i], BUFSIZE, &hash1, &hash2);
+        Add(buf[i], BUFSIZE, &hash1, &hash2);
     }
-    z = GetTickCount();
-    printf("Addition           , uncached: time is %4lld milliseconds\n", z-a);
+    z = std::chrono::high_resolution_clock::now();
+    d = z - a;
+    printf("Addition           , uncached: time is %4g milliseconds\n", d.count()*1000);
     
-    a = GetTickCount();
+    a = std::chrono::high_resolution_clock::now();
     for (uint64 i=0; i<NUMBUF*BUFSIZE/1024; ++i)
     {
-	SpookyHash::Hash128(buf[0], 1024, &hash1, &hash2);
+        SpookyHash::Hash128(buf[0], 1024, &hash1, &hash2);
     }
-    z = GetTickCount();
-    printf("SpookyHash::Hash128,   cached: time is %4lld milliseconds\n", z-a);
+    z = std::chrono::high_resolution_clock::now();
+    d = z - a;
+    printf("SpookyHash::Hash128,   cached: time is %4g milliseconds\n", d.count()*1000);
     
-    a = GetTickCount();
+    a = std::chrono::high_resolution_clock::now();
     for (uint64 i=0; i<NUMBUF*BUFSIZE/1024; ++i)
     {
-	Add(buf[0], 1024, &hash1, &hash2);
+        Add(buf[0], 1024, &hash1, &hash2);
     }
-    z = GetTickCount();
-    printf("Addition           ,   cached: time is %4lld milliseconds\n", z-a);
+    z = std::chrono::high_resolution_clock::now();
+    d = z - a;
+    printf("Addition           ,   cached: time is %4g milliseconds\n", d.count()*1000);
     
     for (int i=0; i<NUMBUF; ++i)
     { 
@@ -216,16 +221,17 @@ void DoTimingSmall(int seed)
     
     for (int i=1; i <= BUFSIZE; i <<= 1)
     {
-        uint64 a = GetTickCount();
+        auto a = std::chrono::high_resolution_clock::now();
         uint64 hash1 = seed;
         uint64 hash2 = seed+i;
         for (int j=0; j<NUMITER; ++j)
         {
             SpookyHash::Hash128((char *)buf, i, &hash1, &hash2);
         }
-        uint64 z = GetTickCount();
-        printf("%d bytes: hash is %.16llx %.16llx, time is %lld\n", 
-               i, hash1, hash2, z-a);
+        auto z = std::chrono::high_resolution_clock::now();
+        std::chrono::duration<double> d = z - a;
+        printf("%d bytes: hash is %.16lx %.16lx, time is %g milliseconds\n", 
+               i, hash1, hash2, d.count()*1000);
     }
 }
 #undef BUFSIZE
@@ -366,19 +372,19 @@ void TestPieces()
         SpookyHash::Hash128(buf, i, &a, &b);
         
         // all as one piece
-	c = 0xdeadbeefdeadbeef;
-	d = 0xbaceba11baceba11;
+        c = 0xdeadbeefdeadbeef;
+        d = 0xbaceba11baceba11;
         state.Init(seed1, seed2);
         state.Update(buf, i);
         state.Final(&c, &d);
         
         if (a != c)
         {
-            printf("wrong a %d: %.16llx %.16llx\n", i, a,c);
+            printf("wrong a %d: %.16lx %.16lx\n", i, a,c);
         }
         if (b != d)
         {
-            printf("wrong b %d: %.16llx %.16llx\n", i, b,d);
+            printf("wrong b %d: %.16lx %.16lx\n", i, b,d);
         }
 
         // all possible two consecutive pieces
@@ -392,11 +398,11 @@ void TestPieces()
             state.Final(&c, &d);
             if (a != c)
             {
-                printf("wrong a %d %d: %.16llx %.16llx\n", j, i, a,c);
+                printf("wrong a %d %d: %.16lx %.16lx\n", j, i, a,c);
             }
             if (b != d)
             {
-                printf("wrong b %d %d: %.16llx %.16llx\n", j, i, b,d);
+                printf("wrong b %d %d: %.16lx %.16lx\n", j, i, b,d);
             }
         }
     }
